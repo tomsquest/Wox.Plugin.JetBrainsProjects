@@ -26,7 +26,7 @@ Android Studio, Aqua, CLion, DataGrip, DataSpell, GoLand, IntelliJ IDEA, PhpStor
 
 ## Requirements
 
-- Wox 2.4.5 or later
+- Wox 2.4.9 or later
 - Python 3.10 or later
 
 ## Installation

@@ -16,12 +16,14 @@ from types import ModuleType
 from unittest import mock
 from xml.sax.saxutils import quoteattr
 
+from wox_plugin import PluginInitParams, Query, QueryEnv, QueryType, RegisterPluginToolResult, Selection
+
 PLUGIN_FILE = Path(__file__).resolve().parent / "Wox.Plugin.JetBrainsProjects.py"
 
 
 def load_module() -> ModuleType:
     """Load the plugin the way Wox's host does: exec its current source into a registered module."""
-    module = ModuleType("wox_single_file_jetbrains_project_test")
+    module = ModuleType("wox_single_file_jetbrains_projects_test")
     module.__file__ = str(PLUGIN_FILE)
     sys.modules[module.__name__] = module
     exec(compile(PLUGIN_FILE.read_text(encoding="utf-8"), str(PLUGIN_FILE), "exec"), module.__dict__)
@@ -63,8 +65,9 @@ def recents_xml(entries: dict, component="RecentProjectsManager") -> str:
 class FakeApi:
     """Records what the plugin asks of Wox. Translations come from the plugin's own metadata."""
 
-    def __init__(self, settings=None):
+    def __init__(self, settings=None, cache_folder=""):
         self.settings = settings or {}
+        self.cache_folder = str(cache_folder)
         self.translations = read_metadata()["I18n"]["en_US"]
         self.notified = []
         self.copied = []
@@ -75,6 +78,9 @@ class FakeApi:
 
     async def get_setting(self, ctx, key):
         return self.settings.get(key, "")
+
+    async def get_cache_folder(self, ctx):
+        return self.cache_folder
 
     async def get_translation(self, ctx, key):
         return self.translations[key]
@@ -87,7 +93,7 @@ class FakeApi:
 
     async def register_plugin_tool(self, ctx, option):
         self.tools[option.tool.name] = option
-        return mock.Mock(error=None)
+        return RegisterPluginToolResult()
 
     async def notify(self, ctx, message):
         self.notified.append(message)
@@ -100,7 +106,23 @@ class FakeApi:
 
 
 def make_query(search, trigger="jb"):
-    return mock.Mock(search=search, trigger_keyword=trigger)
+    return Query(
+        id="",
+        type=QueryType.INPUT,
+        raw_query=search,
+        selection=Selection(),
+        env=QueryEnv(),
+        trigger_keyword=trigger,
+        search=search,
+    )
+
+
+async def stuck_reload(_ctx):
+    await asyncio.sleep(3600)
+
+
+async def first_result(plugin, search):
+    return (await plugin.query(None, make_query(search))).results[0]
 
 
 class FakeHomeTest(unittest.IsolatedAsyncioTestCase):
@@ -153,10 +175,10 @@ class FakeHomeTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.02)
         return self.fail("the launcher was not called")
 
-    async def start_plugin(self, settings=None):
-        plugin = jb.JetBrainsProjectPlugin()
-        api = FakeApi(settings)
-        await plugin.init(None, mock.Mock(api=api))
+    async def start_plugin(self, settings=None, cache_folder=""):
+        plugin = jb.JetBrainsProjectsPlugin()
+        api = FakeApi(settings, cache_folder)
+        await plugin.init(None, PluginInitParams(api=api, plugin_directory=""))
         await plugin.refresh_task
         return plugin, api
 
@@ -170,8 +192,8 @@ class MetadataTest(unittest.TestCase):
 
     def test_declares_what_wox_and_the_store_need(self):
         assert self.metadata["Runtime"] == "PYTHON"
-        assert self.metadata["MinWoxVersion"] == "2.4.5"  # Plugin Tools need 2.4.5.
-        assert self.metadata["TriggerKeywords"] == ["jb"]  # Users can add "*" in Wox's plugin settings.
+        assert self.metadata["MinWoxVersion"] == "2.4.9"  # The first Wox whose host SDK has Result.identity_key.
+        assert self.metadata["TriggerKeywords"] == ["jb"]
         assert set(self.metadata["SupportedOS"]) == {"Windows", "Linux", "Macos"}
         assert self.metadata["Icon"] == "svg:" + jb.IDE_LOGOS["idea"]
 
@@ -184,12 +206,20 @@ class MetadataTest(unittest.TestCase):
         used = set(re.findall(r"i18n:([a-z_]+)", source)) | set(
             re.findall(r'get_translation\(ctx, "([a-z_]+)"\)', source)
         )
-        used |= {"empty_title", "empty_subtitle", "no_match_title", "no_match_subtitle"}
         assert used <= set(self.metadata["I18n"]["en_US"])
 
     def test_every_ide_has_a_logo(self):
         assert set(jb.IDE_LOGOS) == set(jb.IDE_BY_ID)
         assert all(logo.startswith("<svg") and logo.endswith("</svg>") for logo in jb.IDE_LOGOS.values())
+
+    def test_store_entry_and_logo_file_match_the_plugin(self):
+        root = PLUGIN_FILE.parent
+        entry = json.loads((root / "store-plugin.json").read_text(encoding="utf-8"))
+        for key in ("Id", "Name", "Author", "Version", "MinWoxVersion", "Description"):
+            assert entry[key] == self.metadata[key]
+        assert entry["Runtime"] == self.metadata["Runtime"].lower()
+        assert entry["DownloadUrl"].endswith("/" + PLUGIN_FILE.name)
+        assert (root / "icon.svg").read_text(encoding="utf-8").strip() == jb.IDE_LOGOS["idea"]
 
     def test_launcher_setting_offers_every_ide(self):
         table = next(item for item in self.metadata["SettingDefinitions"] if item["Type"] == "table")
@@ -211,7 +241,7 @@ class MatchingTest(unittest.TestCase):
         assert scores == sorted(scores, reverse=True)
         assert scores[-1] == 0
         assert len(set(scores)) == len(scores)
-        assert scores[4] < 50  # Fuzzy matches stay under the bar used for global search.
+        assert scores[4] < 50
         assert scores[3] >= jb.GLOBAL_MIN_SCORE
 
     def test_empty_search_keeps_recency_order(self):
@@ -240,6 +270,15 @@ class MatchingTest(unittest.TestCase):
         assert self.titles([self.project("fynodoro"), self.project("classify_bank_transactions")], "fyno") == [
             "fynodoro"
         ]
+
+    def test_fuzzy_match_measures_the_tightest_stretch(self):
+        assert jb.fuzzy_score("fyd", "ftp-config-fynodoro") == 38
+        assert jb.tightest_span("xyz", "abc") is None
+
+    def test_path_match_ranks_below_a_fuzzy_name_match(self):
+        by_path = self.project("alpha", path="/work/fyn/alpha", last_opened=9)
+        by_fuzzy_name = self.project("fxyxn", last_opened=1)
+        assert self.titles([by_path, by_fuzzy_name], "fyn", match_path=True) == ["fxyxn", "alpha"]
 
     def test_module_alias_matches(self):
         assert self.titles([self.project("dir", aliases=("backend-api",))], "backend") == ["dir"]
@@ -278,6 +317,8 @@ class MatchingTest(unittest.TestCase):
         assert jb.parse_overrides(raw) == {"idea": str(Path("~/x/idea").expanduser())}
         assert jb.parse_overrides("") == {}
         assert jb.parse_overrides("not json") == {}
+        unknown_user = json.dumps([{"ide": "idea", "path": "~no-such-user-here/idea"}])
+        assert jb.parse_overrides(unknown_user) == {"idea": "~no-such-user-here/idea"}
         assert jb.parse_overrides('{"a": 1}') == {}
 
 
@@ -324,7 +365,7 @@ class RecentsTest(FakeHomeTest):
         projects = jb.load_snapshot(self.machine(), {}).projects
         assert [p.name for p in projects] == ["b", "a"]
         assert projects[0].path == str(self.home / "b")
-        assert projects[1].last_opened == 100  # The later of the two timestamps.
+        assert projects[1].last_opened == 100
 
     def test_skips_hidden_macro_missing_and_undated_entries(self):
         self.make_project("kept")
@@ -405,6 +446,27 @@ class RecentsTest(FakeHomeTest):
         assert len(snapshot.errors) == 1
         assert "recentProjects.xml" in snapshot.errors[0]
 
+    def test_finds_versions_with_three_numbers_and_sorts_them(self):
+        (self.home / ".config" / "Google" / "AndroidStudio2024.3").mkdir(parents=True)
+        newest = self.home / ".config" / "Google" / "AndroidStudio2025.1.2"
+        newest.mkdir()
+        assert jb.version_dirs(self.home / ".config", jb.IDE_BY_ID["studio"])[0] == newest
+
+    def test_an_unreadable_project_does_not_hide_the_others(self):
+        self.make_project("readable")
+        locked = self.make_project("locked")
+        self.make_project("locked/project")
+        self.write_recents(
+            "IntelliJIdea2026.3",
+            {
+                "$USER_HOME$/readable": {"projectOpenTimestamp": 1},
+                "$USER_HOME$/locked/project": {"projectOpenTimestamp": 2},
+            },
+        )
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        assert [p.name for p in jb.load_snapshot(self.machine(), {}).projects] == ["readable"]
+
     def test_module_names_become_aliases(self):
         project = self.make_project("dir")
         (project / ".idea").mkdir()
@@ -449,6 +511,18 @@ class LauncherTest(FakeHomeTest):
     def test_falls_back_to_toolbox_scripts_even_when_not_on_the_path(self):
         script = self.write_script(self.home / ".local" / "share" / "JetBrains" / "Toolbox" / "scripts" / "idea")
         assert jb.find_launcher(self.idea, self.machine(), {}) == (str(script),)
+
+    def test_an_unreadable_install_falls_back_to_the_path(self):
+        locked = self.install_ide("IntelliJIdea2026.3").parent
+        script = self.write_script(self.home / "path-bin" / "idea")
+        os.environ["PATH"] = str(script.parent)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        assert jb.find_launcher(self.idea, self.machine(), {}) == (str(script),)
+
+    def test_windows_batch_launchers_get_their_arguments_quoted(self):
+        command = jb.windows_batch_command(("C:\\x\\idea.cmd", "C:\\R&D"))
+        assert command == 'cmd.exe /d /s /c ""C:\\x\\idea.cmd" "C:\\R&D""'
 
     def test_returns_none_when_nothing_is_found(self):
         assert jb.find_launcher(self.idea, self.machine(), {}) is None
@@ -505,7 +579,7 @@ class PluginTest(FakeHomeTest):
 
     async def test_result_row_shows_the_project_and_its_ide_logo(self):
         plugin, _ = await self.start_plugin()
-        result = (await plugin.query(None, make_query("fyno"))).results[0]
+        result = await first_result(plugin, "fyno")
         assert result.title == "fynodoro"
         assert result.sub_title == "~/Dev/fynodoro"
         assert result.identity_key == str(self.project)
@@ -514,7 +588,7 @@ class PluginTest(FakeHomeTest):
 
     async def test_actions_are_open_copy_and_folder_with_open_as_default(self):
         plugin, _ = await self.start_plugin()
-        actions = (await plugin.query(None, make_query("fyno"))).results[0].actions
+        actions = (await first_result(plugin, "fyno")).actions
         assert [action.name for action in actions] == [
             "Open in IntelliJ IDEA",
             "i18n:action_copy_path",
@@ -528,7 +602,7 @@ class PluginTest(FakeHomeTest):
     async def test_open_action_starts_the_launcher_detached_from_home_with_a_clean_env(self):
         plugin, _ = await self.start_plugin()
         os.environ["SHIV_ROOT"] = "/from/the/host"
-        action = (await plugin.query(None, make_query("fyno"))).results[0].actions[0]
+        action = (await first_result(plugin, "fyno")).actions[0]
         await action.action(None, mock.Mock())
         launcher, cwd, shiv_root, args = (await self.wait_for_call()).strip().split("|")
         assert launcher == str(self.install / "bin" / "idea")
@@ -542,7 +616,7 @@ class PluginTest(FakeHomeTest):
             "IntelliJIdea2026.3", {"$USER_HOME$/Dev/with space": {"projectOpenTimestamp": int(time.time() * 1000)}}
         )
         plugin, _ = await self.start_plugin()
-        action = (await plugin.query(None, make_query("with space"))).results[0].actions[0]
+        action = (await first_result(plugin, "with space")).actions[0]
         await action.action(None, mock.Mock())
         assert (await self.wait_for_call()).strip().split("|")[3] == str(project)
 
@@ -552,7 +626,7 @@ class PluginTest(FakeHomeTest):
             "PyCharm2026.3", {"$USER_HOME$/Dev/fynodoro": {"projectOpenTimestamp": int(time.time() * 1000)}}
         )
         plugin, _ = await self.start_plugin()
-        result = (await plugin.query(None, make_query("fyno"))).results[0]
+        result = await first_result(plugin, "fyno")
         assert [tail.text for tail in result.tails] == ["now", "PyCharm"]
         assert [action.name for action in result.actions[:2]] == ["Open in PyCharm", "Open in IntelliJ IDEA"]
         assert [action.is_default for action in result.actions[:2]] == [True, False]
@@ -562,7 +636,7 @@ class PluginTest(FakeHomeTest):
 
     async def test_copy_action(self):
         plugin, api = await self.start_plugin()
-        action = (await plugin.query(None, make_query("fyno"))).results[0].actions[1]
+        action = (await first_result(plugin, "fyno")).actions[1]
         await action.action(None, mock.Mock())
         assert api.copied == [str(self.project)]
 
@@ -570,7 +644,7 @@ class PluginTest(FakeHomeTest):
         bin_dir = self.write_script(self.home / "path-bin" / "xdg-open").parent
         os.environ["PATH"] = str(bin_dir)
         plugin, _ = await self.start_plugin()
-        action = (await plugin.query(None, make_query("fyno"))).results[0].actions[2]
+        action = (await first_result(plugin, "fyno")).actions[2]
         await action.action(None, mock.Mock())
         assert (await self.wait_for_call()).strip().split("|")[3] == str(self.project)
 
@@ -585,7 +659,7 @@ class PluginTest(FakeHomeTest):
     async def test_missing_launcher_warns_on_the_row_and_tells_the_user_where_to_fix_it(self):
         (self.install / "bin" / "idea").unlink()
         plugin, api = await self.start_plugin()
-        result = (await plugin.query(None, make_query("fyno"))).results[0]
+        result = await first_result(plugin, "fyno")
         assert result.tails[-1].text == "i18n:tail_no_launcher"
         await result.actions[0].action(None, mock.Mock())
         assert len(api.notified) == 1
@@ -595,7 +669,7 @@ class PluginTest(FakeHomeTest):
     async def test_a_launcher_that_fails_right_away_is_reported(self):
         self.write_script(self.install / "bin" / "idea", exit_code=3)
         plugin, api = await self.start_plugin()
-        await (await plugin.query(None, make_query("fyno"))).results[0].actions[0].action(None, mock.Mock())
+        await (await first_result(plugin, "fyno")).actions[0].action(None, mock.Mock())
         assert len(api.notified) == 1
         assert "exited with code 3" in api.notified[0]
         assert len(api.logged) == 1
@@ -604,7 +678,7 @@ class PluginTest(FakeHomeTest):
         plugin, api = await self.start_plugin()
         api.settings = {}
         plugin._on_setting_changed(None, "launchers", json.dumps([{"ide": "idea", "path": "/does/not/exist"}]))
-        result = (await plugin.query(None, make_query("fyno"))).results[0]
+        result = await first_result(plugin, "fyno")
         await result.actions[0].action(None, mock.Mock())
         assert len(api.notified) == 1
         assert "/does/not/exist" in api.notified[0]
@@ -614,7 +688,7 @@ class PluginTest(FakeHomeTest):
         script.write_text(f'#!/bin/sh\necho "$*" >> "{self.calls_file}"\n/bin/sleep 1\n')
         plugin, api = await self.start_plugin()
         with mock.patch.object(jb, "LAUNCH_CHECK_SECONDS", 0.2):
-            await (await plugin.query(None, make_query("fyno"))).results[0].actions[0].action(None, mock.Mock())
+            await (await first_result(plugin, "fyno")).actions[0].action(None, mock.Mock())
         assert api.notified == []
 
     async def test_no_match_shows_a_temporary_row_without_identity(self):
@@ -626,9 +700,9 @@ class PluginTest(FakeHomeTest):
 
     async def test_no_match_only_suggests_path_matching_when_it_is_off(self):
         plugin, _ = await self.start_plugin()
-        assert (await plugin.query(None, make_query("zzzzzz"))).results[0].sub_title == "i18n:no_match_subtitle"
+        assert (await first_result(plugin, "zzzzzz")).sub_title == "i18n:no_match_subtitle"
         plugin.match_path = True
-        assert (await plugin.query(None, make_query("zzzzzz"))).results[0].sub_title == ""
+        assert (await first_result(plugin, "zzzzzz")).sub_title == ""
 
     async def test_no_projects_at_all_shows_a_hint(self):
         (self.home / ".config" / "JetBrains" / "IntelliJIdea2026.3" / "options" / "recentProjects.xml").unlink()
@@ -650,7 +724,7 @@ class PluginTest(FakeHomeTest):
     async def test_global_query_does_not_wait_for_a_reload(self):
         plugin, _ = await self.start_plugin()
         plugin.loaded_at = time.monotonic() - jb.BACKGROUND_REFRESH_SECONDS - 1
-        with mock.patch.object(plugin, "_refresh", side_effect=lambda _ctx: asyncio.sleep(3600)):
+        with mock.patch.object(plugin, "_refresh", side_effect=stuck_reload):
             started = time.monotonic()
             await plugin.query(None, make_query("fynodoro", trigger=""))
             assert time.monotonic() - started < 1
@@ -663,27 +737,27 @@ class PluginTest(FakeHomeTest):
         self.write_recents(
             "PyCharm2026.3", {"$USER_HOME$/Dev/brand-new": {"projectOpenTimestamp": int(time.time() * 1000)}}
         )
-        assert (await plugin.query(None, make_query("brand"))).results[0].title == "i18n:no_match_title"
+        assert (await first_result(plugin, "brand")).title == "i18n:no_match_title"
         plugin.loaded_at = time.monotonic() - jb.FOREGROUND_REFRESH_SECONDS - 1
-        assert (await plugin.query(None, make_query("brand"))).results[0].title == "brand-new"
+        assert (await first_result(plugin, "brand")).title == "brand-new"
 
     async def test_match_path_setting_is_read_and_follows_changes(self):
         plugin, api = await self.start_plugin({"match_path": "true"})
-        assert (await plugin.query(None, make_query("Dev"))).results[0].title == "wox-plugin"
+        assert (await first_result(plugin, "Dev")).title == "wox-plugin"
         api.setting_callback(None, "match_path", "false")
-        assert (await plugin.query(None, make_query("Dev"))).results[0].title == "i18n:no_match_title"
+        assert (await first_result(plugin, "Dev")).title == "i18n:no_match_title"
 
     async def test_changing_the_launcher_setting_applies_to_the_next_query(self):
         custom = self.write_script(self.home / "custom" / "my-idea")
         plugin, api = await self.start_plugin()
         api.setting_callback(None, "launchers", json.dumps([{"ide": "idea", "path": str(custom)}]))
-        action = (await plugin.query(None, make_query("fyno"))).results[0].actions[0]
+        action = (await first_result(plugin, "fyno")).actions[0]
         await action.action(None, mock.Mock())
         assert str(custom) in await self.wait_for_call()
 
     async def test_mru_restore_rebuilds_the_same_row_without_calling_wox(self):
         plugin, api = await self.start_plugin()
-        original = (await plugin.query(None, make_query("fyno"))).results[0]
+        original = await first_result(plugin, "fyno")
         context = original.actions[0].context_data
         restored = api.mru_callback(None, mock.Mock(context_data=context))
         assert (restored.title, restored.identity_key) == (original.title, original.identity_key)
@@ -696,7 +770,7 @@ class PluginTest(FakeHomeTest):
         assert api.mru_callback(None, mock.Mock(context_data={})) is None
 
     async def test_mru_restore_before_the_first_load_trusts_its_data_and_can_open(self):
-        plugin = jb.JetBrainsProjectPlugin()
+        plugin = jb.JetBrainsProjectsPlugin()
         plugin.api = FakeApi()
         data = mock.Mock(context_data={"path": str(self.project), "name": "fynodoro", "ide": "idea"})
         restored = plugin._on_mru_restore(None, data)
@@ -732,6 +806,59 @@ class PluginTest(FakeHomeTest):
         plugin.loaded_at = 0.0
         missing = await handler(None, mock.Mock(arguments={"path": str(self.project)}))
         assert missing.error.code == "LAUNCHER_NOT_FOUND"
+
+    async def test_open_tool_finds_an_installed_ide_that_has_no_recent_project(self):
+        pycharm = self.install_ide("PyCharm2026.3", launcher="pycharm")
+        _, api = await self.start_plugin()
+        result = await api.tools["open_project"].handler(
+            None, mock.Mock(arguments={"path": str(self.project), "ide": "pycharm"})
+        )
+        assert result.output == {"path": str(self.project), "ide": "pycharm"}
+        assert str(pycharm / "bin" / "pycharm") in await self.wait_for_call()
+
+    async def test_rows_point_to_cached_logos_when_the_cache_is_available(self):
+        cache = self.make_project("wox-cache")
+        plugin, _ = await self.start_plugin(cache_folder=cache)
+        icon = (await first_result(plugin, "fyno")).icon
+        assert (icon.image_type, icon.image_data) == ("absolute", str(cache / "idea.svg"))
+        assert (cache / "idea.svg").read_text(encoding="utf-8") == jb.IDE_LOGOS["idea"]
+
+    async def test_rows_carry_their_logo_when_the_cache_cannot_be_written(self):
+        plugin, api = await self.start_plugin(cache_folder=self.home / "no-such-folder")
+        assert (await first_result(plugin, "fyno")).icon.image_data == jb.IDE_LOGOS["idea"]
+        assert "cannot cache the logos" in api.logged[0][1]
+
+    async def test_a_failed_first_load_stays_unloaded_and_keeps_mru_rows(self):
+        with mock.patch.object(jb, "load_snapshot", side_effect=RuntimeError("boom")):
+            plugin, api = await self.start_plugin()
+        assert plugin.loaded_at == 0.0
+        assert not plugin.snapshot.loaded
+        restored = api.mru_callback(None, mock.Mock(context_data={"path": str(self.project), "ide": "idea"}))
+        assert restored.title == "fynodoro"
+        assert restored.tails == []
+
+    async def test_a_setting_changed_during_a_load_keeps_the_data_stale(self):
+        plugin, _ = await self.start_plugin()
+        plugin.loaded_at = 0.0
+
+        def change_setting_while_loading(*_):
+            plugin._on_setting_changed(None, "launchers", "[]")
+            return jb.Snapshot(loaded=True)
+
+        with mock.patch.object(jb, "load_snapshot", side_effect=change_setting_while_loading):
+            await plugin._refresh(None)
+        assert plugin.loaded_at == 0.0
+
+    async def test_a_stuck_reload_does_not_hang_a_query(self):
+        plugin, _ = await self.start_plugin()
+        plugin.loaded_at = 0.0
+        with (
+            mock.patch.object(jb, "REFRESH_WAIT_SECONDS", 0.05),
+            mock.patch.object(plugin, "_refresh", side_effect=stuck_reload),
+        ):
+            assert (await first_result(plugin, "fyno")).title == "fynodoro"
+            assert not plugin.refresh_task.done()
+            plugin.refresh_task.cancel()
 
     async def test_tools_declare_their_side_effects(self):
         _, api = await self.start_plugin()

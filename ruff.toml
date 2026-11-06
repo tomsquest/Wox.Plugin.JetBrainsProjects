@@ -4,7 +4,6 @@ line-length = 120
 [lint]
 select = ["ALL"]
 ignore = [
-    "E501",   # The plugin embeds its logos as long SVG strings.
     "COM812", # Conflicts with the Ruff formatter.
     "D203",   # Conflicts with D211.
     "D213",   # Conflicts with D212.
@@ -13,6 +12,7 @@ ignore = [
 
 [lint.per-file-ignores]
 "Wox.Plugin.JetBrainsProjects.py" = [
+    "E501",   # The plugin embeds its logos as long SVG strings.
     "ERA001", # Wox requires the plugin's JSON metadata in a comment, which looks like commented-out code.
     "RUF003", # The Chinese translations in that metadata use fullwidth punctuation.
 ]

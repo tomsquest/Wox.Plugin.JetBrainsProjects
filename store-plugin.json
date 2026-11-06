@@ -3,7 +3,7 @@
   "Name": "JetBrains Projects",
   "Author": "tomsquest",
   "Version": "1.0.0",
-  "MinWoxVersion": "2.4.5",
+  "MinWoxVersion": "2.4.9",
   "Runtime": "python",
   "Description": "Search the recent projects of your JetBrains IDEs and open them",
   "IconUrl": "https://raw.githubusercontent.com/tomsquest/Wox.Plugin.JetBrainsProjects/main/icon.svg",
