@@ -132,10 +132,10 @@ import sys
 import threading
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
-from xml.etree import ElementTree
+from typing import TYPE_CHECKING
 
 from wox_plugin import (
     ActionContext,
@@ -158,6 +158,9 @@ from wox_plugin import (
     ResultTailTextCategory,
     WoxImage,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 FOREGROUND_REFRESH_SECONDS = 5  # A jb query waits for fresh data when it is older than this.
 BACKGROUND_REFRESH_SECONDS = 60  # A global query never waits: it refreshes behind the scenes.
@@ -191,6 +194,8 @@ ICON_FOLDER = WoxImage.new_svg(
 
 @dataclass(frozen=True)
 class Ide:
+    """A JetBrains IDE, and where to find its recent projects and launcher."""
+
     id: str  # Stable id, and the launcher's base name inside the install's bin folder.
     name: str
     config_prefixes: tuple[str, ...]  # "<vendor>/<product>", followed on disk by a version.
@@ -199,9 +204,9 @@ class Ide:
     recents_component: str = "RecentProjectsManager"
 
 
-def _jetbrains_ide(id: str, name: str, **options) -> Ide:
+def _jetbrains_ide(ide_id: str, name: str, **options: str) -> Ide:
     """Declare an IDE that follows the naming convention shared by most JetBrains products."""
-    return Ide(id, name, (f"JetBrains/{name.replace(' ', '')}",), (id, f"{id}-eap"), **options)
+    return Ide(ide_id, name, (f"JetBrains/{name.replace(' ', '')}",), (ide_id, f"{ide_id}-eap"), **options)
 
 
 IDES = (
@@ -249,7 +254,9 @@ IDES = (
         ("pycharm", "charm", "pycharm-eap", "pycharm-professional"),
     ),
     # Rider keeps its recents in its own file, under its own component name.
-    _jetbrains_ide("rider", "Rider", recents_file="recentSolutions.xml", recents_component="RiderRecentProjectsManager"),
+    _jetbrains_ide(
+        "rider", "Rider", recents_file="recentSolutions.xml", recents_component="RiderRecentProjectsManager"
+    ),
     Ide(
         "rubymine",
         "RubyMine",
@@ -290,11 +297,13 @@ class Machine:
     home: Path
 
     @classmethod
-    def current(cls) -> "Machine":
+    def current(cls) -> Machine:
+        """Describe the machine this code runs on."""
         return cls(sys.platform, os.environ, Path.home())
 
     @property
     def config_root(self) -> Path:
+        """Return the folder that holds the IDE vendors' settings."""
         if self.platform == "darwin":
             return self.home / "Library" / "Application Support"
         if self.platform == "win32":
@@ -303,6 +312,7 @@ class Machine:
 
     @property
     def cache_root(self) -> Path:
+        """Return the folder that holds the IDE vendors' caches."""
         if self.platform == "darwin":
             return self.home / "Library" / "Caches"
         if self.platform == "win32":
@@ -311,6 +321,7 @@ class Machine:
 
     @property
     def toolbox_scripts(self) -> Path:
+        """Return the folder where JetBrains Toolbox puts its launchers."""
         if self.platform == "darwin":
             return self.config_root / "JetBrains" / "Toolbox" / "scripts"
         if self.platform == "win32":
@@ -321,6 +332,8 @@ class Machine:
 
 @dataclass(frozen=True)
 class Project:
+    """A recent project, merged across every IDE and IDE version that used it."""
+
     path: str
     name: str
     last_opened: int  # Epoch milliseconds.
@@ -330,16 +343,19 @@ class Project:
 
 @dataclass
 class Snapshot:
+    """Everything read from disk in one load."""
+
     projects: list[Project] = field(default_factory=list)  # Most recently used first.
-    launchers: dict[str, Optional[tuple[str, ...]]] = field(default_factory=dict)  # For each IDE seen in recents.
+    launchers: dict[str, tuple[str, ...] | None] = field(default_factory=dict)  # For each IDE seen in recents.
     errors: list[str] = field(default_factory=list)
 
-    def find(self, path: str) -> Optional[Project]:
+    def find(self, path: str) -> Project | None:
+        """Return the project at path, if it is a recent project."""
         return next((project for project in self.projects if project.path == path), None)
 
 
-class LauncherNotFound(Exception):
-    pass
+class LauncherNotFoundError(Exception):
+    """No way to start an IDE was found."""
 
 
 def version_dirs(root: Path, ide: Ide) -> list[Path]:
@@ -362,7 +378,7 @@ def version_dirs(root: Path, ide: Ide) -> list[Path]:
 
 def read_recent_entries(recents_file: Path, ide: Ide, home: Path) -> dict[str, int]:
     """Map each usable project path in a recents file to when it was last used, in epoch milliseconds."""
-    root = ElementTree.parse(recents_file).getroot()
+    root = ET.parse(recents_file).getroot()  # noqa: S314 - The user's own IDE wrote this file; defusedxml isn't stdlib.
     entries = {}
     for entry in root.findall(f".//component[@name='{ide.recents_component}']//entry[@key]"):
         info = entry.find(".//RecentProjectMetaInfo")
@@ -374,7 +390,8 @@ def read_recent_entries(recents_file: Path, ide: Ide, home: Path) -> dict[str, i
         stamps = [
             int(option.attrib["value"])
             for option in entry.iter("option")
-            if option.get("name") in ("activationTimestamp", "projectOpenTimestamp") and option.get("value", "").isdigit()
+            if option.get("name") in ("activationTimestamp", "projectOpenTimestamp")
+            and option.get("value", "").isdigit()
         ]
         if stamps:
             entries[os.path.normpath(path)] = max(stamps)
@@ -382,6 +399,7 @@ def read_recent_entries(recents_file: Path, ide: Ide, home: Path) -> dict[str, i
 
 
 def project_name(path: str) -> str:
+    """Name a project after its folder, or its solution for Rider."""
     project = Path(path)
     return project.stem if project.suffix in SOLUTION_SUFFIXES else project.name
 
@@ -394,7 +412,7 @@ def module_names(path: str, name: str) -> tuple[str, ...]:
         return ()
 
 
-def launcher_in_install(ide: Ide, install: Path, machine: Machine) -> Optional[tuple[str, ...]]:
+def launcher_in_install(ide: Ide, install: Path, machine: Machine) -> tuple[str, ...] | None:
     """Build the command that starts an install folder (a macOS .app or its Contents, elsewhere the IDE's root)."""
     if machine.platform == "darwin":
         app = install.parent if install.name == "Contents" else install
@@ -409,10 +427,14 @@ def launcher_in_install(ide: Ide, install: Path, machine: Machine) -> Optional[t
     return None
 
 
-def launcher_in_known_folders(ide: Ide, machine: Machine) -> Optional[tuple[str, ...]]:
+def launcher_in_known_folders(ide: Ide, machine: Machine) -> tuple[str, ...] | None:
     """Look where macOS and Windows installers usually put an IDE, newest folder first."""
     if machine.platform == "darwin":
-        parents = (Path("/Applications"), machine.home / "Applications", machine.home / "Applications" / "JetBrains Toolbox")
+        parents = (
+            Path("/Applications"),
+            machine.home / "Applications",
+            machine.home / "Applications" / "JetBrains Toolbox",
+        )
         pattern = f"{ide.name}*.app"
     elif machine.platform == "win32":
         program_files = Path(machine.env.get("ProgramFiles") or r"C:\Program Files")
@@ -428,7 +450,7 @@ def launcher_in_known_folders(ide: Ide, machine: Machine) -> Optional[tuple[str,
     return None
 
 
-def find_launcher(ide: Ide, machine: Machine, overrides: Mapping[str, str]) -> Optional[tuple[str, ...]]:
+def find_launcher(ide: Ide, machine: Machine, overrides: Mapping[str, str]) -> tuple[str, ...] | None:
     """Find the command that starts an IDE. Names on the PATH can be unrelated tools, so the install comes first."""
     override = overrides.get(ide.id)
     if override:
@@ -463,7 +485,7 @@ def load_snapshot(machine: Machine, overrides: Mapping[str, str]) -> Snapshot:
                 entries = read_recent_entries(recents_file, ide, machine.home)
             except FileNotFoundError:
                 continue
-            except (OSError, ElementTree.ParseError) as error:
+            except (OSError, ET.ParseError) as error:
                 snapshot.errors.append(f"cannot read {recents_file}: {error}")
                 continue
             for path, stamp in entries.items():
@@ -471,7 +493,7 @@ def load_snapshot(machine: Machine, overrides: Mapping[str, str]) -> Snapshot:
                 project_uses[ide] = max(stamp, project_uses.get(ide, 0))
 
     for path, project_uses in uses.items():
-        if not os.path.exists(path):
+        if not Path(path).exists():
             continue
         ides = sorted(project_uses, key=lambda ide: project_uses[ide], reverse=True)
         name = project_name(path)
@@ -494,7 +516,7 @@ def parse_overrides(raw: str) -> dict[str, str]:
     overrides = {}
     for row in rows:
         if isinstance(row, dict) and row.get("ide") and row.get("path"):
-            overrides[str(row["ide"])] = os.path.expanduser(str(row["path"]))
+            overrides[str(row["ide"])] = str(Path(str(row["path"])).expanduser())
     return overrides
 
 
@@ -504,21 +526,17 @@ def fold(text: str) -> str:
     return "".join(char for char in decomposed if not unicodedata.combining(char)).casefold()
 
 
-def match_score(term: str, text: str) -> int:
-    """Score how well a folded term matches folded text: 0 is no match, 100 is exact, under 50 is fuzzy."""
-    if term == text:
-        return 100
-    position = text.find(term)
-    if position == 0:
-        return 90
-    if position > 0:
-        while position != -1:
-            if not text[position - 1].isalnum():
-                return 80  # The start of a word.
-            position = text.find(term, position + 1)
-        return 60
+def substring_score(term: str, text: str, position: int) -> int:
+    """Score a term found inside text at position, preferring the start of a word."""
+    while position != -1:
+        if not text[position - 1].isalnum():
+            return 80
+        position = text.find(term, position + 1)
+    return 60
 
-    # Fuzzy: the term's characters appear in order. The tighter they sit together, the better.
+
+def fuzzy_score(term: str, text: str) -> int:
+    """Score a term whose characters appear in order: the tighter they sit together, the better."""
     start = None
     position = -1
     for char in term:
@@ -533,7 +551,17 @@ def match_score(term: str, text: str) -> int:
     return 20 + 30 * len(term) // span
 
 
-def project_score(terms: list[str], project: Project, match_path: bool) -> int:
+def match_score(term: str, text: str) -> int:
+    """Score how well a folded term matches folded text: 0 is no match, 100 is exact, under 50 is fuzzy."""
+    if term == text:
+        return 100
+    position = text.find(term)
+    if position == 0:
+        return 90
+    return substring_score(term, text, position) if position > 0 else fuzzy_score(term, text)
+
+
+def project_score(terms: list[str], project: Project, *, match_path: bool) -> int:
     """Score a project on its weakest search term, so that every term has to match."""
     names = [fold(name) for name in (project.name, *project.aliases)]
     path = fold(project.path) if match_path else ""
@@ -549,19 +577,19 @@ def project_score(terms: list[str], project: Project, match_path: bool) -> int:
 
 
 def rank_projects(
-    projects: list[Project], search: str, match_path: bool = False, min_score: int = 1
+    projects: list[Project], search: str, *, match_path: bool = False, min_score: int = 1
 ) -> list[tuple[Project, int]]:
     """Filter projects by search, best match first and most recent first among equals."""
     terms = fold(search).split()
     if not terms:
         return [(project, 0) for project in projects]
-    scored = ((project, project_score(terms, project, match_path)) for project in projects)
+    scored = ((project, project_score(terms, project, match_path=match_path)) for project in projects)
     ranked = [pair for pair in scored if pair[1] >= min_score]
     ranked.sort(key=lambda pair: (-pair[1], -pair[0].last_opened))
     return ranked
 
 
-def format_age(last_opened: int, now: Optional[int] = None) -> str:
+def format_age(last_opened: int, now: int | None = None) -> str:
     """Format how long ago an epoch-millisecond time was, in a short form that needs no translation."""
     if last_opened <= 0:
         return ""
@@ -576,6 +604,7 @@ def format_age(last_opened: int, now: Optional[int] = None) -> str:
 
 
 def display_path(path: str, home: Path) -> str:
+    """Shorten the home folder to ~."""
     return "~" + path[len(str(home)) :] if path == str(home) or path.startswith(f"{home}{os.sep}") else path
 
 
@@ -587,7 +616,7 @@ def spawn_detached(argv: tuple[str, ...]) -> subprocess.Popen:
         options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         options["start_new_session"] = True
-    return subprocess.Popen(list(argv), cwd=Path.home(), env=env, **options)
+    return subprocess.Popen(list(argv), cwd=Path.home(), env=env, **options)  # noqa: S603 - No shell, and the command is the user's own IDE.
 
 
 async def run_detached(argv: tuple[str, ...]) -> None:
@@ -600,29 +629,41 @@ async def run_detached(argv: tuple[str, ...]) -> None:
         threading.Thread(target=process.wait, daemon=True).start()
         return
     if code != 0:
-        raise OSError(f"{argv[0]} exited with code {code}")
+        message = f"{argv[0]} exited with code {code}"
+        raise OSError(message)
+
+
+def project_folder(path: str) -> str:
+    """Return a project's folder. A Rider project is a file, so that is the folder it sits in."""
+    project = Path(path)
+    return str(project if project.is_dir() else project.parent)
 
 
 async def open_folder(path: str) -> None:
-    """Show a project in the file manager. A Rider project is a file, so show its folder."""
-    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    """Show a project in the file manager."""
+    folder = await asyncio.to_thread(project_folder, path)
     if sys.platform == "win32":
-        os.startfile(folder)  # explorer.exe reports failure even when it succeeds, so it can't go through run_detached.
+        # explorer.exe reports failure even when it succeeds, so it can't go through run_detached.
+        os.startfile(folder)  # noqa: S606 - Opens the project's own folder.
     else:
         await run_detached(("open" if sys.platform == "darwin" else "xdg-open", folder))
 
 
 class JetBrainsProjectPlugin:
+    """The plugin that Wox loads."""
+
     def __init__(self) -> None:
+        """Start with no data: init() triggers the first load."""
         self.api = None
         self.snapshot = Snapshot()
         self.loaded_at = 0.0  # time.monotonic() of the last load, 0 when the snapshot needs loading.
-        self.refresh_task: Optional[asyncio.Task] = None
+        self.refresh_task: asyncio.Task | None = None
         self.match_path = False
         self.overrides: dict[str, str] = {}
         self.open_in_label = "Open in {ide}"
 
     async def init(self, ctx: Context, params: PluginInitParams) -> None:
+        """Read the settings, register the callbacks and tools, and start loading projects."""
         self.api = params.api
         self.match_path = await self.api.get_setting(ctx, "match_path") == "true"
         self.overrides = parse_overrides(await self.api.get_setting(ctx, "launchers"))
@@ -633,6 +674,7 @@ class JetBrainsProjectPlugin:
         self._start_refresh(ctx)  # Global queries and MRU restores need data but never wait for it.
 
     async def query(self, ctx: Context, query: Query) -> QueryResponse:
+        """Answer a jb query or, if the user added the * keyword, a global query."""
         search = query.search.strip()
         is_global = not query.trigger_keyword
         if is_global and len(search) < GLOBAL_MIN_SEARCH_LENGTH:
@@ -644,12 +686,14 @@ class JetBrainsProjectPlugin:
             ranked = rank_projects(self.snapshot.projects, search, min_score=GLOBAL_MIN_SCORE)
             return QueryResponse(results=[self._build_result(project, score) for project, score in ranked])
 
-        ranked = rank_projects(self.snapshot.projects, search, self.match_path)
+        ranked = rank_projects(self.snapshot.projects, search, match_path=self.match_path)
         if not ranked:
             return QueryResponse(results=[self._build_empty_state()])
         # Wox sorts by score, so turn the order decided above into scores.
         total = len(ranked)
-        return QueryResponse(results=[self._build_result(project, total - index) for index, (project, _) in enumerate(ranked)])
+        return QueryResponse(
+            results=[self._build_result(project, total - index) for index, (project, _) in enumerate(ranked)]
+        )
 
     def _start_refresh(self, ctx: Context) -> asyncio.Task:
         """Start reloading the snapshot unless a reload is already running."""
@@ -662,13 +706,13 @@ class JetBrainsProjectPlugin:
             self.snapshot = await asyncio.to_thread(load_snapshot, Machine.current(), self.overrides)
             for error in self.snapshot.errors:
                 await self.api.log(ctx, LogLevel.WARNING, error)
-        except Exception as error:  # Keep serving the last good data; a query must not fail because of a reload.
+        except Exception as error:  # noqa: BLE001 - Keep serving the last good data: a reload must not fail a query.
             await self.api.log(ctx, LogLevel.ERROR, f"cannot load JetBrains projects: {error!r}")
         finally:
             self.loaded_at = time.monotonic()
             self.refresh_task = None
 
-    async def _ensure_fresh(self, ctx: Context, wait: bool) -> None:
+    async def _ensure_fresh(self, ctx: Context, *, wait: bool) -> None:
         max_age = FOREGROUND_REFRESH_SECONDS if wait else BACKGROUND_REFRESH_SECONDS
         if self.loaded_at and time.monotonic() - self.loaded_at < max_age:
             return
@@ -676,14 +720,14 @@ class JetBrainsProjectPlugin:
         if wait:
             await task
 
-    def _on_setting_changed(self, ctx: Context, key: str, value: str) -> None:
+    def _on_setting_changed(self, _ctx: Context, key: str, value: str) -> None:
         if key == "match_path":
             self.match_path = value == "true"
         elif key == "launchers":
             self.overrides = parse_overrides(value)
             self.loaded_at = 0.0
 
-    def _on_mru_restore(self, ctx: Context, mru_data: MRUData) -> Optional[Result]:
+    def _on_mru_restore(self, _ctx: Context, mru_data: MRUData) -> Result | None:
         """Rebuild a start-page row from memory only: Wox drops the row if this takes over 300 ms."""
         data = mru_data.context_data or {}
         path = data.get("path", "")
@@ -718,7 +762,7 @@ class JetBrainsProjectPlugin:
     def _build_actions(self, project: Project) -> list[ResultAction]:
         context = {"path": project.path, "name": project.name, "ide": project.ides[0].id}
 
-        def open_in(ide: Ide, is_default: bool) -> ResultAction:
+        def open_in(ide: Ide, *, is_default: bool) -> ResultAction:
             async def run(ctx: Context, _: ActionContext) -> None:
                 await self._open_from_action(ctx, project.path, ide)
 
@@ -735,7 +779,7 @@ class JetBrainsProjectPlugin:
                 await self._notify_open_failed(ctx, project.path, error)
 
         return [
-            *(open_in(ide, index == 0) for index, ide in enumerate(project.ides)),
+            *(open_in(ide, is_default=index == 0) for index, ide in enumerate(project.ides)),
             ResultAction(name="i18n:action_copy_path", icon=ICON_COPY, action=copy_path, context_data=context),
             ResultAction(name="i18n:action_open_folder", icon=ICON_FOLDER, action=show_folder, context_data=context),
         ]
@@ -747,18 +791,18 @@ class JetBrainsProjectPlugin:
         return Result(title="i18n:no_match_title", sub_title=hint, icon=ICON_PLUGIN)
 
     async def _open_in_ide(self, ctx: Context, path: str, ide: Ide) -> None:
-        """Open path in ide. Raises LauncherNotFound or OSError."""
+        """Open path in ide. Raises LauncherNotFoundError or OSError."""
         if not self.loaded_at:
             await self._ensure_fresh(ctx, wait=True)  # A row restored from MRU can run before the first load.
         launcher = self.snapshot.launchers.get(ide.id)
         if launcher is None:
-            raise LauncherNotFound(ide.name)
+            raise LauncherNotFoundError(ide.name)
         await run_detached((*launcher, path))
 
     async def _open_from_action(self, ctx: Context, path: str, ide: Ide) -> None:
         try:
             await self._open_in_ide(ctx, path, ide)
-        except LauncherNotFound:
+        except LauncherNotFoundError:
             message = await self.api.get_translation(ctx, "launcher_missing")
             await self.api.notify(ctx, message.replace("{ide}", ide.name))
         except OSError as error:
@@ -778,7 +822,10 @@ class JetBrainsProjectPlugin:
                     input_schema={
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Search terms. Leave out to list recent projects."},
+                            "query": {
+                                "type": "string",
+                                "description": "Search terms. Leave out to list recent projects.",
+                            },
                             "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                         },
                     },
@@ -832,7 +879,9 @@ class JetBrainsProjectPlugin:
             ),
         )
         for descriptor, handler in tools:
-            result = await self.api.register_plugin_tool(ctx, RegisterPluginToolOption(tool=descriptor, handler=handler))
+            result = await self.api.register_plugin_tool(
+                ctx, RegisterPluginToolOption(tool=descriptor, handler=handler)
+            )
             if result.error:
                 await self.api.log(ctx, LogLevel.ERROR, f"cannot register {descriptor.name}: {result.error.message}")
 
@@ -840,7 +889,7 @@ class JetBrainsProjectPlugin:
         self, ctx: Context, option: InvokePluginToolHandlerOption
     ) -> InvokePluginToolHandlerResult:
         await self._ensure_fresh(ctx, wait=True)
-        ranked = rank_projects(self.snapshot.projects, option.arguments.get("query", ""), self.match_path)
+        ranked = rank_projects(self.snapshot.projects, option.arguments.get("query", ""), match_path=self.match_path)
         projects = [
             {
                 "name": project.name,
@@ -863,7 +912,7 @@ class JetBrainsProjectPlugin:
         ide = IDE_BY_ID.get(option.arguments.get("ide", "")) or project.ides[0]
         try:
             await self._open_in_ide(ctx, path, ide)
-        except LauncherNotFound:
+        except LauncherNotFoundError:
             return _tool_error("LAUNCHER_NOT_FOUND", f"no launcher found for {ide.name}")
         except OSError as error:
             return _tool_error("EXECUTION_FAILED", str(error))
