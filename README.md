@@ -2,7 +2,7 @@
 
 Search the recent projects of your JetBrains IDEs from [Wox](https://github.com/Wox-launcher/Wox) and open them.
 
-![Searching for a project with jb fyno in Wox](screenshot.png)
+![Recent projects listed by the jb keyword in Wox](screenshot.png)
 
 > **Tested on Linux only**, with IntelliJ IDEA. macOS and Windows are supported in the code but have never been run on a real machine. The other IDEs are covered by automated tests with sample data only. Reports are welcome.
 
