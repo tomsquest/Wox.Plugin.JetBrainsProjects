@@ -15,15 +15,6 @@
 #   ],
 #   "SettingDefinitions": [
 #     {
-#       "Type": "checkbox",
-#       "Value": {
-#         "Key": "match_path",
-#         "Label": "i18n:setting_match_path",
-#         "Tooltip": "i18n:setting_match_path_tip",
-#         "DefaultValue": "false"
-#       }
-#     },
-#     {
 #       "Type": "table",
 #       "IsPlatformSpecific": true,
 #       "Value": {
@@ -73,12 +64,11 @@
 #       "empty_title": "No JetBrains projects found",
 #       "empty_subtitle": "Open a project in a JetBrains IDE, then search again",
 #       "no_match_title": "No matching project",
-#       "no_match_subtitle": "Turn on path matching in the plugin settings to search folders too",
+#       "no_match_subtitle": "Turn on the path filter to search folders too",
 #       "tail_no_launcher": "No launcher",
 #       "launcher_missing": "No launcher found for {ide}. Set its path in the JetBrains Projects plugin settings.",
 #       "open_failed": "Could not open {target}: {error}",
-#       "setting_match_path": "Match project paths",
-#       "setting_match_path_tip": "In jb queries, search the project path as well as its name.",
+#       "filter_match_path": "Match project paths",
 #       "setting_launchers": "IDE launchers",
 #       "setting_launchers_tip": "Only needed when the plugin cannot find an IDE by itself.",
 #       "setting_column_ide": "IDE",
@@ -93,12 +83,11 @@
 #       "empty_title": "未找到 JetBrains 项目",
 #       "empty_subtitle": "请先在 JetBrains IDE 中打开项目，然后重新搜索",
 #       "no_match_title": "没有匹配的项目",
-#       "no_match_subtitle": "可在插件设置中开启路径匹配，以同时搜索文件夹",
+#       "no_match_subtitle": "可开启路径筛选，以同时搜索文件夹",
 #       "tail_no_launcher": "无启动器",
 #       "launcher_missing": "未找到 {ide} 的启动器。请在 JetBrains Projects 插件设置中填写其路径。",
 #       "open_failed": "无法打开 {target}：{error}",
-#       "setting_match_path": "匹配项目路径",
-#       "setting_match_path_tip": "在 jb 查询中，除项目名称外也搜索项目路径。",
+#       "filter_match_path": "匹配项目路径",
 #       "setting_launchers": "IDE 启动器",
 #       "setting_launchers_tip": "仅在插件无法自动找到 IDE 时需要设置。",
 #       "setting_column_ide": "IDE",
@@ -152,6 +141,9 @@ from wox_plugin import (
     PluginToolDescriptor,
     PluginToolError,
     Query,
+    QueryRefinement,
+    QueryRefinementOption,
+    QueryRefinementType,
     QueryResponse,
     RegisterPluginToolOption,
     Result,
@@ -174,6 +166,7 @@ GLOBAL_MIN_SCORE = 60  # Keeps fuzzy matches out of global search, where they wo
 PATH_MATCH_SCORE = 20  # Below any match on the name, even fuzzy ones (at least 30), so names always rank first.
 FUZZY_MAX_SPREAD = 3  # A fuzzy match may span at most this many characters per search character.
 
+MATCH_PATH_FILTER = "match_path"
 SOLUTION_SUFFIXES = {".sln", ".slnx"}
 UNRESOLVED_MACRO = re.compile(r"\$\w+\$")
 
@@ -613,6 +606,17 @@ def display_path(path: str, home: Path) -> str:
     return "~" + path[len(str(home)) :] if path == str(home) or path.startswith(f"{home}{os.sep}") else path
 
 
+def match_path_filter(label: str) -> QueryRefinement:
+    """Build the launcher filter that extends a jb search to project paths. Wox doesn't translate its label."""
+    return QueryRefinement(
+        id=MATCH_PATH_FILTER,
+        title=label,
+        type=QueryRefinementType.TOGGLE,
+        hotkey=f"{'cmd' if sys.platform == 'darwin' else 'ctrl'}+d",
+        options=[QueryRefinementOption(value="true", title=label)],
+    )
+
+
 def write_logo_files(folder: Path) -> dict[str, WoxImage]:
     """Write the logos to the cache, so that result rows carry a path instead of kilobytes of SVG on every keystroke."""
     icons = {}
@@ -682,17 +686,17 @@ class JetBrainsProjectsPlugin:
         self.snapshot = Snapshot()
         self.loaded_at = 0.0  # time.monotonic() of the last good load, 0 when the snapshot needs loading.
         self.refresh_task: asyncio.Task | None = None
-        self.match_path = False
         self.overrides: dict[str, str] = {}
         self.open_in_label = "Open in {ide}"
+        self.match_path_label = "Match project paths"
         self.icons: dict[str, WoxImage] = {}
 
     async def init(self, ctx: Context, params: PluginInitParams) -> None:
         """Read the settings, register the callbacks and tools, and start loading projects."""
         self.api = params.api
-        self.match_path = await self.api.get_setting(ctx, "match_path") == "true"
         self.overrides = parse_overrides(await self.api.get_setting(ctx, "launchers"))
         self.open_in_label = await self.api.get_translation(ctx, "action_open_in")
+        self.match_path_label = await self.api.get_translation(ctx, "filter_match_path")
         await self.api.on_setting_changed(ctx, self._on_setting_changed)
         await self.api.on_mru_restore(ctx, self._on_mru_restore)
         await self._register_tools(ctx)
@@ -712,13 +716,16 @@ class JetBrainsProjectsPlugin:
             ranked = rank_projects(self.snapshot.projects, search, min_score=GLOBAL_MIN_SCORE)
             return QueryResponse(results=[self._build_result(project, score) for project, score in ranked])
 
-        ranked = rank_projects(self.snapshot.projects, search, match_path=self.match_path)
+        match_path = query.refinements.get(MATCH_PATH_FILTER) == "true"
+        filters = [match_path_filter(self.match_path_label)]
+        ranked = rank_projects(self.snapshot.projects, search, match_path=match_path)
         if not ranked:
-            return QueryResponse(results=[self._build_empty_state()])
+            return QueryResponse(results=[self._build_empty_state(match_path=match_path)], refinements=filters)
         # Wox sorts by score, so turn the order decided above into scores.
         total = len(ranked)
         return QueryResponse(
-            results=[self._build_result(project, total - index) for index, (project, _) in enumerate(ranked)]
+            results=[self._build_result(project, total - index) for index, (project, _) in enumerate(ranked)],
+            refinements=filters,
         )
 
     async def _cache_logos(self, ctx: Context) -> None:
@@ -753,9 +760,7 @@ class JetBrainsProjectsPlugin:
             await asyncio.wait({self.refresh_task}, timeout=REFRESH_WAIT_SECONDS)
 
     def _on_setting_changed(self, _ctx: Context, key: str, value: str) -> None:
-        if key == "match_path":
-            self.match_path = value == "true"
-        elif key == "launchers":
+        if key == "launchers":
             self.overrides = parse_overrides(value)
             self.loaded_at = 0.0
 
@@ -816,10 +821,10 @@ class JetBrainsProjectsPlugin:
             ResultAction(name="i18n:action_open_folder", icon=ICON_FOLDER, action=show_folder, context_data=context),
         ]
 
-    def _build_empty_state(self) -> Result:
+    def _build_empty_state(self, *, match_path: bool) -> Result:
         if not self.snapshot.projects:
             return Result(title="i18n:empty_title", sub_title="i18n:empty_subtitle", icon=ICON_PLUGIN)
-        hint = "" if self.match_path else "i18n:no_match_subtitle"  # The hint suggests turning on path matching.
+        hint = "" if match_path else "i18n:no_match_subtitle"  # The hint suggests turning on path matching.
         return Result(title="i18n:no_match_title", sub_title=hint, icon=ICON_PLUGIN)
 
     async def _open_in_ide(self, ctx: Context, path: str, ide: Ide) -> None:
@@ -924,7 +929,7 @@ class JetBrainsProjectsPlugin:
         self, ctx: Context, option: InvokePluginToolHandlerOption
     ) -> InvokePluginToolHandlerResult:
         await self._ensure_fresh(ctx, wait=True)
-        ranked = rank_projects(self.snapshot.projects, option.arguments.get("query", ""), match_path=self.match_path)
+        ranked = rank_projects(self.snapshot.projects, option.arguments.get("query", ""))
         projects = [
             {
                 "name": project.name,

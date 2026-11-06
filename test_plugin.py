@@ -105,7 +105,7 @@ class FakeApi:
         self.logged.append((level, message))
 
 
-def make_query(search, trigger="jb"):
+def make_query(search, trigger="jb", refinements=None):
     return Query(
         id="",
         type=QueryType.INPUT,
@@ -114,6 +114,7 @@ def make_query(search, trigger="jb"):
         env=QueryEnv(),
         trigger_keyword=trigger,
         search=search,
+        refinements=refinements or {},
     )
 
 
@@ -701,8 +702,8 @@ class PluginTest(FakeHomeTest):
     async def test_no_match_only_suggests_path_matching_when_it_is_off(self):
         plugin, _ = await self.start_plugin()
         assert (await first_result(plugin, "zzzzzz")).sub_title == "i18n:no_match_subtitle"
-        plugin.match_path = True
-        assert (await first_result(plugin, "zzzzzz")).sub_title == ""
+        response = await plugin.query(None, make_query("zzzzzz", refinements={"match_path": "true"}))
+        assert response.results[0].sub_title == ""
 
     async def test_no_projects_at_all_shows_a_hint(self):
         (self.home / ".config" / "JetBrains" / "IntelliJIdea2026.3" / "options" / "recentProjects.xml").unlink()
@@ -741,11 +742,24 @@ class PluginTest(FakeHomeTest):
         plugin.loaded_at = time.monotonic() - jb.FOREGROUND_REFRESH_SECONDS - 1
         assert (await first_result(plugin, "brand")).title == "brand-new"
 
-    async def test_match_path_setting_is_read_and_follows_changes(self):
-        plugin, api = await self.start_plugin({"match_path": "true"})
-        assert (await first_result(plugin, "Dev")).title == "wox-plugin"
-        api.setting_callback(None, "match_path", "false")
+    async def test_path_filter_extends_the_search_to_project_paths(self):
+        plugin, _ = await self.start_plugin()
+        response = await plugin.query(None, make_query("Dev", refinements={"match_path": "true"}))
+        assert response.results[0].title == "wox-plugin"
         assert (await first_result(plugin, "Dev")).title == "i18n:no_match_title"
+
+    async def test_path_filter_is_offered_even_when_nothing_matches(self):
+        plugin, _ = await self.start_plugin()
+        for search in ("", "zzzzzz"):
+            [path_filter] = (await plugin.query(None, make_query(search))).refinements
+            assert (path_filter.id, path_filter.hotkey) == ("match_path", "ctrl+d")
+            assert path_filter.title == "Match project paths"
+            assert path_filter.default_value == []
+            assert [option.value for option in path_filter.options] == ["true"]
+
+    async def test_global_query_offers_no_filter(self):
+        plugin, _ = await self.start_plugin()
+        assert (await plugin.query(None, make_query("fynodoro", trigger=""))).refinements == []
 
     async def test_changing_the_launcher_setting_applies_to_the_next_query(self):
         custom = self.write_script(self.home / "custom" / "my-idea")

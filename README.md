@@ -17,6 +17,7 @@ Search the recent projects of your JetBrains IDEs from [Wox](https://github.com/
 | --- | --- |
 | `Enter` | Opens the project in the IDE that last used it |
 | `Ctrl+K` | Opens the Action Panel: open in another IDE that knows the project, copy the path, or open the folder |
+| `Ctrl+D` | Also searches project paths, until you leave `jb` (`Cmd+D` on macOS) |
 
 Projects you open also appear on the Wox start page.
 
@@ -39,7 +40,6 @@ The plugin finds your IDEs by itself, through the install folder each IDE record
 
 Open them from the Action Panel, or from the installed plugins in the Wox settings.
 
-- **Match project paths**: in `jb` queries, search the project path as well as its name.
 - **IDE launchers**: set the path of an IDE's launcher, if the plugin can't find it.
 - **Trigger keywords**: add `*` to also see projects in global search, without typing `jb`. Global search only matches project names closely.
 
