@@ -61,13 +61,11 @@ On each commit, the hook runs [Ruff](https://github.com/astral-sh/ruff) to lint 
 
 ### Tests
 
-The tests use the Wox SDK of a local Wox install:
+The tests run on Python 3.10, the oldest version Wox supports, with the Wox SDK from PyPI:
 
 ```bash
-uvx --python /usr/bin/python3 pytest
+uvx --python 3.10 --with wox-plugin==0.0.92 pytest
 ```
-
-Pass the Python interpreter that runs Wox's Python host, shown in the host's process list.
 
 ### Running your changes in Wox
 

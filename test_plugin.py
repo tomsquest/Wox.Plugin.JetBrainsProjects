@@ -1,8 +1,6 @@
-"""Tests for the single-file plugin, using the Wox SDK bundled with the installed Python host.
+"""Tests for the single-file plugin, on the oldest Python that Wox supports.
 
-Run with the interpreter Wox uses:
-
-    uvx --python /usr/bin/python3 pytest
+uvx --python 3.10 --with wox-plugin==0.0.92 pytest
 """
 
 import asyncio
@@ -18,9 +16,7 @@ from types import ModuleType
 from unittest import mock
 from xml.sax.saxutils import quoteattr
 
-WOX_DIR = Path.home() / ".wox"
 PLUGIN_FILE = Path(__file__).resolve().parent / "Wox.Plugin.JetBrainsProjects.py"
-sys.path.insert(0, str(WOX_DIR / "hosts" / "python-host.pyz" / "site-packages"))
 
 
 def load_module() -> ModuleType:
